@@ -1,6 +1,7 @@
 #include "libmotioncapture/optitrack.h"
 
 #include <boost/asio.hpp>
+#include <cstring>
 #include <iostream>
 
 using boost::asio::ip::udp;
@@ -98,152 +99,178 @@ namespace libmotioncapture {
     //     }
     //   } 
 
-    void parseModelDef(const char* data)
+    void parseModelDef(const char* data, size_t data_size)
     {
       const char *ptr = data;
+      const char *end = data + data_size;
+
+      auto canRead = [&](size_t n) {
+        return ptr + n <= end;
+      };
+
+      auto consumeCString = [&]() {
+        const void *term = std::memchr(ptr, '\0', static_cast<size_t>(end - ptr));
+        if (!term) {
+          return false;
+        }
+        ptr = static_cast<const char *>(term) + 1;
+        return true;
+      };
+
       int major = versionMajor;
       int minor = versionMinor;
 
-      // First 2 Bytes is message ID
+      if (!canRead(2)) {
+        return;
+      }
       int MessageID = 0;
       memcpy(&MessageID, ptr, 2); ptr += 2;
-      // printf("Message ID : %d\n", MessageID);
 
-      // Second 2 Bytes is the size of the packet
+      if (!canRead(2)) {
+        return;
+      }
       int nBytes = 0;
       memcpy(&nBytes, ptr, 2); ptr += 2;
-      // printf("Byte count : %d\n", nBytes);
 
-      if(MessageID == NAT_MODELDEF) // Data Descriptions
+      if (MessageID != NAT_MODELDEF) {
+        return;
+      }
+
+      if (!canRead(4)) {
+        return;
+      }
+      int nDatasets = 0; memcpy(&nDatasets, ptr, 4); ptr += 4;
+
+      for (int i = 0; i < nDatasets; i++)
       {
-        // number of datasets
-        int nDatasets = 0; memcpy(&nDatasets, ptr, 4); ptr += 4;
-        // printf("Dataset Count : %d\n", nDatasets);
+        if (!canRead(4)) {
+          return;
+        }
+        int type = 0; memcpy(&type, ptr, 4); ptr += 4;
 
-        for(int i=0; i < nDatasets; i++)
+        int description_size = 0;
+        if ((major == 4 && minor >= 1) || major > 4)
         {
-          // printf("Dataset %d\n", i);
+          if (!canRead(4)) {
+            return;
+          }
+          memcpy(&description_size, ptr, 4); ptr += 4;
+        }
 
-          int type = 0; memcpy(&type, ptr, 4); ptr += 4;
-          int description_size = 0;
-          // printf("Type : %d\n", i, type);
-
-          if ((major == 4 && minor >= 1) || major > 4)
-          {
-            // If the NatNet version is 4.1 or greater, next four bytes represent
-            // the number of bytes in the dataset. Just skip them.
-            memcpy(&description_size, ptr, 4); ptr += 4;
+        if (type == 0)   // markerset
+        {
+          if (!consumeCString()) {
+            return;
           }
 
-          if(type == 0)   // markerset
-          {
-            ptr += strlen(ptr) + 1; // name
+          if (!canRead(4)) {
+            return;
+          }
+          int nMarkers = 0; memcpy(&nMarkers, ptr, 4); ptr += 4;
 
-            // marker data
+          for (int j = 0; j < nMarkers; j++)
+          {
+            if (!consumeCString()) {
+              return;
+            }
+          }
+        }
+        else if (type == 1)   // rigid body
+        {
+          char szName[MAX_NAMELENGTH];
+          szName[0] = '\0';
+
+          if (major >= 2)
+          {
+            const void *term = std::memchr(ptr, '\0', static_cast<size_t>(end - ptr));
+            if (!term) {
+              return;
+            }
+            const size_t len = static_cast<const char *>(term) - ptr;
+            const size_t copy_len = (len < (MAX_NAMELENGTH - 1)) ? len : (MAX_NAMELENGTH - 1);
+            std::memcpy(szName, ptr, copy_len);
+            szName[copy_len] = '\0';
+            ptr = static_cast<const char *>(term) + 1;
+          }
+
+          if (!canRead(4)) {
+            return;
+          }
+          int ID = 0; memcpy(&ID, ptr, 4); ptr += 4;
+
+          rigidBodyDefinitions[ID].name = szName;
+          rigidBodyDefinitions[ID].ID = ID;
+
+          if (!canRead(16)) {
+            return;
+          }
+          memcpy(&rigidBodyDefinitions[ID].parentID, ptr, 4); ptr += 4;
+          memcpy(&rigidBodyDefinitions[ID].xoffset, ptr, 4); ptr += 4;
+          memcpy(&rigidBodyDefinitions[ID].yoffset, ptr, 4); ptr += 4;
+          memcpy(&rigidBodyDefinitions[ID].zoffset, ptr, 4); ptr += 4;
+
+          if (major >= 3)
+          {
+            if (!canRead(4)) {
+              return;
+            }
             int nMarkers = 0; memcpy(&nMarkers, ptr, 4); ptr += 4;
-            // printf("Marker Count : %d\n", nMarkers);
 
-            for(int j=0; j < nMarkers; j++)
-            {
-              ptr += strlen(ptr) + 1;
+            nBytes = nMarkers * 3 * sizeof(float);
+            if (!canRead(static_cast<size_t>(nBytes))) {
+              return;
             }
-          }
-          else if(type ==1)   // rigid body
-          {
-            char szName[MAX_NAMELENGTH];
-            if(major >= 2)
-            {
-              // name
-              strcpy(szName, ptr);
-              ptr += strlen(ptr) + 1;
-              // printf("Name: %s\n", szName);
+            ptr += nBytes;
+
+            nBytes = nMarkers * sizeof(int);
+            if (!canRead(static_cast<size_t>(nBytes))) {
+              return;
             }
+            ptr += nBytes;
 
-            int ID = 0; memcpy(&ID, ptr, 4); ptr +=4;
-            // printf("ID : %d\n", ID);
-
-            rigidBodyDefinitions[ID].name = szName;
-            rigidBodyDefinitions[ID].ID = ID;
-         
-            memcpy(&rigidBodyDefinitions[ID].parentID, ptr, 4); ptr +=4;
-            memcpy(&rigidBodyDefinitions[ID].xoffset, ptr, 4); ptr +=4;
-            memcpy(&rigidBodyDefinitions[ID].yoffset, ptr, 4); ptr +=4;
-            memcpy(&rigidBodyDefinitions[ID].zoffset, ptr, 4); ptr +=4;
-
-            // Per-marker data (NatNet 3.0 and later)
-            if ( major >= 3 )
-            {
-              int nMarkers = 0; memcpy( &nMarkers, ptr, 4 ); ptr += 4;
-              // Marker positions
-              nBytes = nMarkers * 3 * sizeof(float);
-              ptr += nBytes;
-              // Marker required active labels
-              nBytes = nMarkers * sizeof(int);
-              ptr += nBytes;
-              // Marker Name
-              if (major >= 4) {
-                for (int markerIdx = 0; markerIdx < nMarkers; ++markerIdx) {
-                  ptr += strlen(ptr) + 1;
+            if (major >= 4) {
+              for (int markerIdx = 0; markerIdx < nMarkers; ++markerIdx) {
+                if (!consumeCString()) {
+                  return;
                 }
               }
             }
           }
-          else if ((major == 4 && minor >= 1) || major > 4)
-          {
-            // We got a description_size for > 4.1, which is simpler to discard
-            // for unsuported datatypes
-            ptr += description_size;
+        }
+        else if ((major == 4 && minor >= 1) || major > 4)
+        {
+          if (description_size < 0 || !canRead(static_cast<size_t>(description_size))) {
+            return;
           }
-          else if(type ==2)   // skeleton
+          ptr += description_size;
+        }
+        else if (type == 2)   // skeleton
+        {
+          if (!consumeCString()) {
+            return;
+          }
+
+          if (!canRead(8)) {
+            return;
+          }
+          ptr += 4;
+          int nRigidBodies = 0; memcpy(&nRigidBodies, ptr, 4); ptr += 4;
+
+          for (int j = 0; j < nRigidBodies; j++)
           {
-            // char szName[MAX_NAMELENGTH];
-            // strcpy(szName, ptr);
-            ptr += strlen(ptr) + 1;
-            // printf("Name: %s\n", szName);
-
-            // int ID = 0; memcpy(&ID, ptr, 4);
-            ptr +=4;
-            // printf("ID : %d\n", ID);
-
-            int nRigidBodies = 0; memcpy(&nRigidBodies, ptr, 4); ptr +=4;
-            // printf("RigidBody (Bone) Count : %d\n", nRigidBodies);
-
-            for(int i=0; i< nRigidBodies; i++)
+            if (major >= 2)
             {
-                if(major >= 2)
-                {
-                    // RB name
-                    // char szName[MAX_NAMELENGTH];
-                    // strcpy(szName, ptr);
-                    ptr += strlen(ptr) + 1;
-                    // printf("Rigid Body Name: %s\n", szName);
-                }
-
-                // int ID = 0; memcpy(&ID, ptr, 4);
-                ptr +=4;
-                // printf("RigidBody ID : %d\n", ID);
-
-                // int parentID = 0; memcpy(&parentID, ptr, 4);
-                ptr +=4;
-                // printf("Parent ID : %d\n", parentID);
-
-                // float xoffset = 0; memcpy(&xoffset, ptr, 4);
-                ptr +=4;
-                // printf("X Offset : %3.2f\n", xoffset);
-
-                // float yoffset = 0; memcpy(&yoffset, ptr, 4);
-                ptr +=4;
-                // printf("Y Offset : %3.2f\n", yoffset);
-
-                // float zoffset = 0; memcpy(&zoffset, ptr, 4);
-                ptr +=4;
-                // printf("Z Offset : %3.2f\n", zoffset);
+              if (!consumeCString()) {
+                return;
+              }
             }
+
+            if (!canRead(20)) {
+              return;
+            }
+            ptr += 20;
           }
-        }   // next dataset
-
-       // printf("End Packet\n-------------\n");
-
+        }
       }
     }
 
@@ -355,7 +382,7 @@ namespace libmotioncapture {
     reply_length = socket_cmd.receive_from(
         boost::asio::buffer(modelDef.data(), modelDef.size()), sender_endpoint);
     modelDef.resize(reply_length);
-    pImpl->parseModelDef(modelDef.data());
+    pImpl->parseModelDef(modelDef.data(), modelDef.size());
 
       // ----------------------------------------------------------------------
 // [NEW] Send a NatNet "Client Connect" handshake for unicast mode
@@ -399,7 +426,17 @@ if (!response.IsMulticast) {
 
 
    // connect to data port to receive mocap data
-auto listen_address_boost = boost::asio::ip::make_address_v4("141.23.110.162");
+auto listen_address_boost = boost::asio::ip::address_v4::any();
+if (!interface_ip.empty() && interface_ip != "0.0.0.0") {
+  boost::system::error_code address_ec;
+  auto parsed_address = boost::asio::ip::make_address_v4(interface_ip, address_ec);
+  if (!address_ec) {
+    listen_address_boost = parsed_address;
+  } else {
+    std::cerr << "Invalid interface_ip '" << interface_ip
+              << "', falling back to 0.0.0.0: " << address_ec.message() << std::endl;
+  }
+}
 
 pImpl->socket.open(boost::asio::ip::udp::v4());
 pImpl->socket.set_option(boost::asio::ip::udp::socket::reuse_address(true));
@@ -455,8 +492,6 @@ if (response.IsMulticast) {
       pImpl->data.resize(MAX_PACKETSIZE);
       size_t length = pImpl->socket.receive_from(boost::asio::buffer(pImpl->data.data(), pImpl->data.size()), pImpl->sender_endpoint);
       pImpl->data.resize(length);
-      std::cout << "[VRPN DEBUG] Received " << length
-          << " bytes from " << std::endl;
     } while (pImpl->socket.available() > 0);
 
     if (pImpl->data.size() > 4) {
@@ -795,7 +830,7 @@ if (response.IsMulticast) {
       }
       else
       {
-          printf("Unrecognized Packet Type.\n");
+          // Ignore packet types not handled by this parser.
       }
     }
 
