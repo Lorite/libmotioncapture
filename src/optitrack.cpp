@@ -117,20 +117,123 @@ namespace libmotioncapture {
         return true;
       };
 
-      int major = versionMajor;
-      int minor = versionMinor;
+      auto readCString = [&](std::string& value) {
+        const void *term = std::memchr(ptr, '\0', static_cast<size_t>(end - ptr));
+        if (!term) {
+          return false;
+        }
+        const char *term_ptr = static_cast<const char *>(term);
+        value.assign(ptr, term_ptr - ptr);
+        ptr = term_ptr + 1;
+        return true;
+      };
 
-      if (!canRead(2)) {
+      const int major = versionMajor;
+      const int minor = versionMinor;
+      const bool has_description_size = (major > 4) || (major == 4 && minor >= 1);
+
+      auto parseRigidBodyDescription = [&](const std::string& fallback_name) {
+        std::string parsed_name;
+        if (major >= 2)
+        {
+          if (!readCString(parsed_name)) {
+            return false;
+          }
+        }
+
+        if (!canRead(4)) {
+          return false;
+        }
+        int ID = 0;
+        memcpy(&ID, ptr, 4); ptr += 4;
+
+        auto& def = rigidBodyDefinitions[ID];
+        if (!parsed_name.empty()) {
+          def.name = parsed_name;
+        } else if (!fallback_name.empty() && def.name.empty()) {
+          def.name = fallback_name;
+        }
+        def.ID = ID;
+
+        if (!canRead(16)) {
+          return false;
+        }
+        memcpy(&def.parentID, ptr, 4); ptr += 4;
+        memcpy(&def.xoffset, ptr, 4); ptr += 4;
+        memcpy(&def.yoffset, ptr, 4); ptr += 4;
+        memcpy(&def.zoffset, ptr, 4); ptr += 4;
+
+        // NatNet 4.2+ adds local orientation offsets to rigid body descriptions.
+        if ((major > 4) || (major == 4 && minor >= 2))
+        {
+          if (!canRead(16)) {
+            return false;
+          }
+          ptr += 16;
+        }
+
+        if (major >= 3)
+        {
+          if (!canRead(4)) {
+            return false;
+          }
+          int nMarkers = 0;
+          memcpy(&nMarkers, ptr, 4); ptr += 4;
+          if (nMarkers < 0) {
+            return false;
+          }
+
+          const size_t marker_positions_bytes = static_cast<size_t>(nMarkers) * 3U * sizeof(float);
+          if (!canRead(marker_positions_bytes)) {
+            return false;
+          }
+          ptr += marker_positions_bytes;
+
+          const size_t marker_ids_bytes = static_cast<size_t>(nMarkers) * sizeof(int);
+          if (!canRead(marker_ids_bytes)) {
+            return false;
+          }
+          ptr += marker_ids_bytes;
+
+          if (major >= 4)
+          {
+            for (int marker_idx = 0; marker_idx < nMarkers; ++marker_idx) {
+              if (!consumeCString()) {
+                return false;
+              }
+            }
+          }
+        }
+
+        if (def.name.empty()) {
+          def.name = "rigid_body_" + std::to_string(ID);
+        }
+
+        return true;
+      };
+
+      auto parseMarkerDescription = [&]() {
+        if (!consumeCString()) {
+          return false;
+        }
+
+        // marker ID (4) + position xyz (12) + size (4) + params (2)
+        if (!canRead(22)) {
+          return false;
+        }
+        ptr += 22;
+        return true;
+      };
+
+      if (!canRead(4)) {
         return;
       }
+
       int MessageID = 0;
-      memcpy(&MessageID, ptr, 2); ptr += 2;
-
-      if (!canRead(2)) {
-        return;
-      }
       int nBytes = 0;
+      memcpy(&MessageID, ptr, 2); ptr += 2;
       memcpy(&nBytes, ptr, 2); ptr += 2;
+      (void)nBytes;
 
       if (MessageID != NAT_MODELDEF) {
         return;
@@ -139,137 +242,148 @@ namespace libmotioncapture {
       if (!canRead(4)) {
         return;
       }
-      int nDatasets = 0; memcpy(&nDatasets, ptr, 4); ptr += 4;
+      int nDatasets = 0;
+      memcpy(&nDatasets, ptr, 4); ptr += 4;
 
-      for (int i = 0; i < nDatasets; i++)
+      for (int i = 0; i < nDatasets; ++i)
       {
         if (!canRead(4)) {
           return;
         }
-        int type = 0; memcpy(&type, ptr, 4); ptr += 4;
+        int type = 0;
+        memcpy(&type, ptr, 4); ptr += 4;
 
         int description_size = 0;
-        if ((major == 4 && minor >= 1) || major > 4)
+        const char *description_end = nullptr;
+        if (has_description_size)
         {
           if (!canRead(4)) {
             return;
           }
           memcpy(&description_size, ptr, 4); ptr += 4;
+
+          if (description_size < 0) {
+            return;
+          }
+          if (!canRead(static_cast<size_t>(description_size))) {
+            return;
+          }
+          description_end = ptr + description_size;
         }
 
-        if (type == 0)   // markerset
+        if (type == 1) // rigid body
         {
-          if (!consumeCString()) {
+          if (!parseRigidBodyDescription("")) {
             return;
+          }
+        }
+        else if (type == 6) // asset (NatNet 4.1+)
+        {
+          std::string asset_name;
+          if (!readCString(asset_name)) {
+            return;
+          }
+
+          // asset type + asset id
+          if (!canRead(8)) {
+            return;
+          }
+          ptr += 8;
+
+          if (!canRead(4)) {
+            return;
+          }
+          int nRigidBodies = 0;
+          memcpy(&nRigidBodies, ptr, 4); ptr += 4;
+          if (nRigidBodies < 0) {
+            return;
+          }
+
+          for (int rb_idx = 0; rb_idx < nRigidBodies; ++rb_idx)
+          {
+            if (!parseRigidBodyDescription(asset_name)) {
+              return;
+            }
           }
 
           if (!canRead(4)) {
             return;
           }
-          int nMarkers = 0; memcpy(&nMarkers, ptr, 4); ptr += 4;
+          int nMarkers = 0;
+          memcpy(&nMarkers, ptr, 4); ptr += 4;
+          if (nMarkers < 0) {
+            return;
+          }
 
-          for (int j = 0; j < nMarkers; j++)
+          for (int marker_idx = 0; marker_idx < nMarkers; ++marker_idx)
+          {
+            if (!parseMarkerDescription()) {
+              return;
+            }
+          }
+        }
+        else if (!has_description_size)
+        {
+          if (type == 0) // markerset
           {
             if (!consumeCString()) {
               return;
             }
-          }
-        }
-        else if (type == 1)   // rigid body
-        {
-          char szName[MAX_NAMELENGTH];
-          szName[0] = '\0';
 
-          if (major >= 2)
-          {
-            const void *term = std::memchr(ptr, '\0', static_cast<size_t>(end - ptr));
-            if (!term) {
-              return;
-            }
-            const size_t len = static_cast<const char *>(term) - ptr;
-            const size_t copy_len = (len < (MAX_NAMELENGTH - 1)) ? len : (MAX_NAMELENGTH - 1);
-            std::memcpy(szName, ptr, copy_len);
-            szName[copy_len] = '\0';
-            ptr = static_cast<const char *>(term) + 1;
-          }
-
-          if (!canRead(4)) {
-            return;
-          }
-          int ID = 0; memcpy(&ID, ptr, 4); ptr += 4;
-
-          rigidBodyDefinitions[ID].name = szName;
-          rigidBodyDefinitions[ID].ID = ID;
-
-          if (!canRead(16)) {
-            return;
-          }
-          memcpy(&rigidBodyDefinitions[ID].parentID, ptr, 4); ptr += 4;
-          memcpy(&rigidBodyDefinitions[ID].xoffset, ptr, 4); ptr += 4;
-          memcpy(&rigidBodyDefinitions[ID].yoffset, ptr, 4); ptr += 4;
-          memcpy(&rigidBodyDefinitions[ID].zoffset, ptr, 4); ptr += 4;
-
-          if (major >= 3)
-          {
             if (!canRead(4)) {
               return;
             }
-            int nMarkers = 0; memcpy(&nMarkers, ptr, 4); ptr += 4;
+            int nMarkers = 0;
+            memcpy(&nMarkers, ptr, 4); ptr += 4;
 
-            nBytes = nMarkers * 3 * sizeof(float);
-            if (!canRead(static_cast<size_t>(nBytes))) {
-              return;
-            }
-            ptr += nBytes;
-
-            nBytes = nMarkers * sizeof(int);
-            if (!canRead(static_cast<size_t>(nBytes))) {
-              return;
-            }
-            ptr += nBytes;
-
-            if (major >= 4) {
-              for (int markerIdx = 0; markerIdx < nMarkers; ++markerIdx) {
-                if (!consumeCString()) {
-                  return;
-                }
-              }
-            }
-          }
-        }
-        else if ((major == 4 && minor >= 1) || major > 4)
-        {
-          if (description_size < 0 || !canRead(static_cast<size_t>(description_size))) {
-            return;
-          }
-          ptr += description_size;
-        }
-        else if (type == 2)   // skeleton
-        {
-          if (!consumeCString()) {
-            return;
-          }
-
-          if (!canRead(8)) {
-            return;
-          }
-          ptr += 4;
-          int nRigidBodies = 0; memcpy(&nRigidBodies, ptr, 4); ptr += 4;
-
-          for (int j = 0; j < nRigidBodies; j++)
-          {
-            if (major >= 2)
+            for (int marker_idx = 0; marker_idx < nMarkers; ++marker_idx)
             {
               if (!consumeCString()) {
                 return;
               }
             }
-
-            if (!canRead(20)) {
+          }
+          else if (type == 2) // skeleton
+          {
+            if (!consumeCString()) {
               return;
             }
-            ptr += 20;
+
+            if (!canRead(8)) {
+              return;
+            }
+            ptr += 4; // skeleton id
+            int nRigidBodies = 0;
+            memcpy(&nRigidBodies, ptr, 4); ptr += 4;
+
+            for (int rb_idx = 0; rb_idx < nRigidBodies; ++rb_idx)
+            {
+              if (major >= 2)
+              {
+                if (!consumeCString()) {
+                  return;
+                }
+              }
+
+              if (!canRead(20)) {
+                return;
+              }
+              ptr += 20;
+            }
           }
+          else
+          {
+            // Without per-dataset byte sizes we cannot safely skip unknown types.
+            return;
+          }
+        }
+
+        if (has_description_size)
+        {
+          if (ptr > description_end) {
+            return;
+          }
+          ptr = description_end;
         }
       }
     }
@@ -842,12 +956,32 @@ if (response.IsMulticast) {
     rigidBodies_.clear();
     for (const auto& rb : pImpl->rigidBodies) {
       if (rb.bTrackingValid) {
-        const auto& def = pImpl->rigidBodyDefinitions[rb.ID];
+        std::string name;
+        float xoffset = 0.0f;
+        float yoffset = 0.0f;
+        float zoffset = 0.0f;
+
+        const auto def_it = pImpl->rigidBodyDefinitions.find(rb.ID);
+        if (def_it != pImpl->rigidBodyDefinitions.end()) {
+          const auto& def = def_it->second;
+          name = def.name;
+          xoffset = def.xoffset;
+          yoffset = def.yoffset;
+          zoffset = def.zoffset;
+        }
+
+        if (name.empty()) {
+          name = "rigid_body_" + std::to_string(rb.ID);
+        }
+
+        if (rigidBodies_.find(name) != rigidBodies_.end()) {
+          name += "_" + std::to_string(rb.ID);
+        }
 
         Eigen::Vector3f position(
-          rb.x + def.xoffset,
-          rb.y + def.yoffset,
-          rb.z + def.zoffset);
+          rb.x + xoffset,
+          rb.y + yoffset,
+          rb.z + zoffset);
 
         Eigen::Quaternionf rotation(
           rb.qw, // w
@@ -855,7 +989,7 @@ if (response.IsMulticast) {
           rb.qy, // y
           rb.qz  // z
           );
-        rigidBodies_.emplace(def.name, RigidBody(def.name, position, rotation));
+        rigidBodies_.emplace(name, RigidBody(name, position, rotation));
       }
     }
     return rigidBodies_;
@@ -888,4 +1022,3 @@ if (response.IsMulticast) {
   }
 
 }
-
