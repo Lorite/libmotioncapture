@@ -439,12 +439,6 @@ namespace libmotioncapture {
   {
     pImpl = new MotionCaptureOptitrackImpl;
 
-    // Connect to command port to query version
-    boost::asio::io_context io_context_cmd;
-    udp::socket socket_cmd(io_context_cmd, udp::endpoint(udp::v4(), 0));
-    udp::resolver resolver_cmd(io_context_cmd);
-    udp::endpoint endpoint_cmd(boost::asio::ip::make_address(hostname), port_command);
-
     typedef struct
     {
       unsigned short iMessage;                // message ID (e.g. NAT_FRAMEOFDATA)
@@ -464,17 +458,71 @@ namespace libmotioncapture {
       uint8_t MulticastGroupAddress[4];
     } sResponse;
 
+    // Resolve the interface to listen on (defaults to 0.0.0.0 = let kernel pick).
+    auto listen_address_boost = boost::asio::ip::address_v4::any();
+    if (!interface_ip.empty() && interface_ip != "0.0.0.0") {
+      boost::system::error_code address_ec;
+      auto parsed_address = boost::asio::ip::make_address_v4(interface_ip, address_ec);
+      if (!address_ec) {
+        listen_address_boost = parsed_address;
+      } else {
+        std::cerr << "Invalid interface_ip '" << interface_ip
+                  << "', falling back to 0.0.0.0: " << address_ec.message() << std::endl;
+      }
+    }
+
+    // Bind the data socket BEFORE any NatNet handshake. Motive keys the unicast
+    // stream destination to the (source IP, source port) of the *first* NatNet
+    // command it receives from this client, so the initial NAT_CONNECT must
+    // originate from the socket where we expect to receive frames.
+    constexpr uint16_t kDefaultDataPort = 1511;
+    pImpl->socket.open(boost::asio::ip::udp::v4());
+    pImpl->socket.set_option(boost::asio::ip::udp::socket::reuse_address(true));
+
+    boost::system::error_code bind_ec;
+    boost::asio::ip::udp::endpoint local_endpoint(listen_address_boost, kDefaultDataPort);
+    pImpl->socket.bind(local_endpoint, bind_ec);
+    if (bind_ec) {
+      throw std::runtime_error(
+        "Failed to bind NatNet data socket to " + local_endpoint.address().to_string() +
+        ":" + std::to_string(kDefaultDataPort) + ": " + bind_ec.message());
+    }
+
+    udp::endpoint endpoint_cmd(boost::asio::ip::make_address(hostname), port_command);
+    udp::endpoint sender_endpoint;
+    std::vector<char> recv_buf(MAX_PACKETSIZE);
+
+    // Read one packet of a specific NatNet message ID, dropping any frame-data
+    // packets (id=7) that may interleave once Motive has started streaming.
+    auto receive_message = [&](uint16_t expected_id, void* out, size_t out_size) -> size_t {
+      for (int attempts = 0; attempts < 200; ++attempts) {
+        boost::system::error_code rx_ec;
+        size_t len = pImpl->socket.receive_from(
+            boost::asio::buffer(recv_buf.data(), recv_buf.size()),
+            sender_endpoint, 0, rx_ec);
+        if (rx_ec || len < 2) {
+          continue;
+        }
+        uint16_t msg_id = 0;
+        std::memcpy(&msg_id, recv_buf.data(), 2);
+        if (msg_id != expected_id) {
+          continue;
+        }
+        const size_t copy_len = std::min(len, out_size);
+        std::memcpy(out, recv_buf.data(), copy_len);
+        return len;
+      }
+      throw std::runtime_error("Did not receive expected NatNet message id=" +
+                               std::to_string(expected_id));
+    };
+
+    // NAT_CONNECT — also serves as the unicast subscribe (registers our
+    // source port as the unicast destination on the Motive side).
     sRequest connectCmd = {NAT_CONNECT, 0};
-    socket_cmd.send_to(boost::asio::buffer(&connectCmd, sizeof(connectCmd)), endpoint_cmd);
+    pImpl->socket.send_to(boost::asio::buffer(&connectCmd, sizeof(connectCmd)), endpoint_cmd);
 
     sResponse response;
-    udp::endpoint sender_endpoint;
-    size_t reply_length = socket_cmd.receive_from(
-        boost::asio::buffer(&response, sizeof(response)), sender_endpoint);
-
-    if (response.iMessage != NAT_SERVERINFO) {
-      throw std::runtime_error("Could not query NatNet version!");
-    }
+    receive_message(NAT_SERVERINFO, &response, sizeof(response));
 
     std::ostringstream stringStream;
     stringStream << (int)response.NatNetVersion[0] << "."
@@ -487,111 +535,43 @@ namespace libmotioncapture {
     pImpl->versionMinor = response.NatNetVersion[1];
     memcpy(&pImpl->clockFrequency, response.HighResClockFrequency, sizeof(uint64_t));
 
-    uint16_t port_data = response.DataPort;
+    const uint16_t port_data = response.DataPort;
+    if (port_data != kDefaultDataPort) {
+      std::cerr << "Warning: Motive reports DataPort=" << port_data
+                << " but we bound to " << kDefaultDataPort
+                << ". Reconfigure Motive's data port to " << kDefaultDataPort
+                << " if frames don't arrive." << std::endl;
+    }
 
-    // query model def
+    // NAT_REQUEST_MODELDEF — fetch rigid-body names. Frame data may already be
+    // interleaved at this point if Motive is in unicast mode, hence the loop.
     sRequest modelDefCmd = {NAT_REQUEST_MODELDEF, 0};
-    socket_cmd.send_to(boost::asio::buffer(&modelDefCmd, sizeof(modelDefCmd)), endpoint_cmd);
+    pImpl->socket.send_to(boost::asio::buffer(&modelDefCmd, sizeof(modelDefCmd)), endpoint_cmd);
     std::vector<char> modelDef(MAX_PACKETSIZE);
-    reply_length = socket_cmd.receive_from(
-        boost::asio::buffer(modelDef.data(), modelDef.size()), sender_endpoint);
-    modelDef.resize(reply_length);
+    size_t modelDef_len = receive_message(NAT_MODELDEF, modelDef.data(), modelDef.size());
+    modelDef.resize(modelDef_len);
     pImpl->parseModelDef(modelDef.data(), modelDef.size());
 
-      // ----------------------------------------------------------------------
-// [NEW] Send a NatNet "Client Connect" handshake for unicast mode
-// ----------------------------------------------------------------------
+    if (response.IsMulticast) {
+      std::stringstream sstr;
+      sstr << (int)response.MulticastGroupAddress[0] << "."
+           << (int)response.MulticastGroupAddress[1] << "."
+           << (int)response.MulticastGroupAddress[2] << "."
+           << (int)response.MulticastGroupAddress[3];
+      std::string multicast_address = sstr.str();
+      auto multicast_address_boost = boost::asio::ip::make_address_v4(multicast_address);
 
-if (!response.IsMulticast) {
-  std::cout << "[NatNet] Sending Client Connect request to server..." << std::endl;
+      pImpl->socket.set_option(
+        boost::asio::ip::multicast::join_group(multicast_address_boost, listen_address_boost));
 
-  // Command port is usually 1510
-  const uint16_t port_cmd = 1510;
-
-  // Build a NatNet "Connect" command (message ID 0x0002)
-  PACK(struct NatNetCommand {
-    uint16_t messageId;
-    uint16_t packetSize;
-  });
-
-  NatNetCommand connectCmd;
-  connectCmd.messageId = 0x0002;  // "Client Connect" message
-  connectCmd.packetSize = 0;
-
-  boost::asio::ip::udp::socket socket_cmd_tmp(io_context_cmd);
-  socket_cmd_tmp.open(boost::asio::ip::udp::v4());
-
-  boost::asio::ip::udp::endpoint server_endpoint(
-      boost::asio::ip::make_address_v4(hostname), port_cmd);
-
-  boost::system::error_code ec;
-  socket_cmd_tmp.send_to(boost::asio::buffer(&connectCmd, sizeof(connectCmd)),
-                         server_endpoint, 0, ec);
-
-  if (ec) {
-    std::cerr << "[NatNet] Failed to send Client Connect request: " << ec.message() << std::endl;
-  } else {
-    std::cout << "[NatNet] Sent Client Connect request to "
-              << hostname << ":" << port_cmd << std::endl;
-  }
-
-  // socket_cmd_tmp.close();
-}
-
-
-   // connect to data port to receive mocap data
-auto listen_address_boost = boost::asio::ip::address_v4::any();
-if (!interface_ip.empty() && interface_ip != "0.0.0.0") {
-  boost::system::error_code address_ec;
-  auto parsed_address = boost::asio::ip::make_address_v4(interface_ip, address_ec);
-  if (!address_ec) {
-    listen_address_boost = parsed_address;
-  } else {
-    std::cerr << "Invalid interface_ip '" << interface_ip
-              << "', falling back to 0.0.0.0: " << address_ec.message() << std::endl;
-  }
-}
-
-pImpl->socket.open(boost::asio::ip::udp::v4());
-pImpl->socket.set_option(boost::asio::ip::udp::socket::reuse_address(true));
-
-if (response.IsMulticast) {
-  std::stringstream sstr;
-  sstr << (int)response.MulticastGroupAddress[0] << "."
-       << (int)response.MulticastGroupAddress[1] << "."
-       << (int)response.MulticastGroupAddress[2] << "."
-       << (int)response.MulticastGroupAddress[3];
-  std::string multicast_address = sstr.str();
-  auto multicast_address_boost = boost::asio::ip::make_address_v4(multicast_address);
-
-  // Bind to any address for multicast
-  boost::asio::ip::udp::endpoint listen_endpoint(boost::asio::ip::address_v4::any(), port_data);
-  pImpl->socket.bind(listen_endpoint);
-
-  // Join the multicast group on a specific interface
-  pImpl->socket.set_option(boost::asio::ip::multicast::join_group(multicast_address_boost, listen_address_boost));
-
-  std::cout << "Joined multicast group " << multicast_address
-            << " on interface " << listen_address_boost << std::endl;
-
-} else {
-  // UNICAST MODE
-  std::ostringstream ustr;
-  ustr << "Using unicast from server " << hostname << ":" << port_data;
-  std::cout << ustr.str() << std::endl;
-
-  boost::system::error_code ec;
-
-  boost::asio::ip::udp::endpoint local_endpoint(listen_address_boost, port_data);
-  pImpl->socket.bind(local_endpoint, ec);
-
-  if (ec) {
-    std::cerr << "Failed to bind unicast UDP socket: " << ec.message() << std::endl;
-  } else {
-    std::cout << "Bound UDP socket to " << local_endpoint.address().to_string()
-              << ":" << local_endpoint.port() << " for unicast reception." << std::endl;
-  }
-}
+      std::cout << "Joined multicast group " << multicast_address
+                << " on interface " << listen_address_boost
+                << " (port " << kDefaultDataPort << ")" << std::endl;
+    } else {
+      std::cout << "Using unicast from server " << hostname << ":" << port_data
+                << ", receiving on " << local_endpoint.address().to_string()
+                << ":" << kDefaultDataPort << std::endl;
+    }
   }
 
   const std::string & MotionCaptureOptitrack::version() const
