@@ -1,8 +1,11 @@
 #include "libmotioncapture/optitrack.h"
 
 #include <boost/asio.hpp>
+#include <chrono>
 #include <cstring>
 #include <iostream>
+#include <sys/socket.h>
+#include <sys/time.h>
 
 using boost::asio::ip::udp;
 
@@ -398,6 +401,8 @@ namespace libmotioncapture {
     boost::asio::io_context io_context;
     boost::asio::ip::udp::socket socket;
     boost::asio::ip::udp::endpoint sender_endpoint;
+    boost::asio::ip::udp::endpoint endpoint_cmd;  // stored for keepalive pings
+    std::chrono::steady_clock::time_point last_keepalive;
     std::vector<char> data;
 
     struct rigidBody {
@@ -488,6 +493,14 @@ namespace libmotioncapture {
         ":" + std::to_string(kDefaultDataPort) + ": " + bind_ec.message());
     }
 
+    // Set a receive timeout so waitForNextFrame() can detect a stalled stream
+    // (e.g. Motive restart, network glitch).  In normal operation, NAT_KEEPALIVE
+    // pings (sent from waitForNextFrame() every 1 s) keep Motive's ~10 s
+    // unicast session timer fresh and this timeout never fires.
+    struct timeval rcvtimeo { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(pImpl->socket.native_handle(), SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&rcvtimeo), sizeof(rcvtimeo));
+
     udp::endpoint endpoint_cmd(boost::asio::ip::make_address(hostname), port_command);
     udp::endpoint sender_endpoint;
     std::vector<char> recv_buf(MAX_PACKETSIZE);
@@ -572,6 +585,10 @@ namespace libmotioncapture {
                 << ", receiving on " << local_endpoint.address().to_string()
                 << ":" << kDefaultDataPort << std::endl;
     }
+
+    // Store the command endpoint so waitForNextFrame() can send keepalive pings.
+    pImpl->endpoint_cmd = endpoint_cmd;
+    pImpl->last_keepalive = std::chrono::steady_clock::now();
   }
 
   const std::string & MotionCaptureOptitrack::version() const
@@ -581,12 +598,61 @@ namespace libmotioncapture {
 
   void MotionCaptureOptitrack::waitForNextFrame()
   {
-    // use a loop to get latest data
-    do {
+    // Send NAT_KEEPALIVE (message ID 10) every second to prevent Motive from
+    // closing the unicast session with NAT_DISCONNECTBYTIMEOUT (~10 s timeout).
+    // This mirrors what libNatNet.so's UnicastKeepaliveThread_Func does.
+    // NAT_CONNECT (ID 0) is NOT a keepalive — it's the initial-connect message
+    // and Motive does not refresh the session timer in response to it.
+    {
+      auto now = std::chrono::steady_clock::now();
+      auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          now - pImpl->last_keepalive).count();
+      if (elapsed_ms >= 1000) {
+        struct { uint16_t iMessage; uint16_t nDataBytes; } keepalive =
+            {10 /* NAT_KEEPALIVE */, 0};
+        boost::system::error_code ec;
+        pImpl->socket.send_to(
+            boost::asio::buffer(&keepalive, sizeof(keepalive)),
+            pImpl->endpoint_cmd, 0, ec);
+        pImpl->last_keepalive = now;
+      }
+    }
+
+    // Block until we receive a frame.  On SO_RCVTIMEO expiry (EAGAIN /
+    // would_block) the stream has stalled; send a NAT_CONNECT re-handshake
+    // attempt and wait again.  Any other error (e.g. SIGINT → EBADF)
+    // propagates so the caller can shut down cleanly.
+    while (true) {
       pImpl->data.resize(MAX_PACKETSIZE);
-      size_t length = pImpl->socket.receive_from(boost::asio::buffer(pImpl->data.data(), pImpl->data.size()), pImpl->sender_endpoint);
+      boost::system::error_code ec;
+      size_t length = pImpl->socket.receive_from(
+          boost::asio::buffer(pImpl->data.data(), pImpl->data.size()),
+          pImpl->sender_endpoint, 0, ec);
+      if (ec) {
+        if (ec == boost::asio::error::would_block) {
+          // Stream stalled — attempt a NAT_CONNECT re-handshake.  The
+          // periodic NAT_KEEPALIVE above prevents this in steady state.
+          struct { uint16_t iMessage; uint16_t nDataBytes; } reconnect = {0, 0};
+          boost::system::error_code reconnect_ec;
+          pImpl->socket.send_to(
+              boost::asio::buffer(&reconnect, sizeof(reconnect)), pImpl->endpoint_cmd,
+              0, reconnect_ec);
+          continue;
+        }
+        throw boost::system::system_error(ec);
+      }
       pImpl->data.resize(length);
-    } while (pImpl->socket.available() > 0);
+      break;
+    }
+
+    // Drain any additional queued frames to get the latest data.
+    while (pImpl->socket.available() > 0) {
+      pImpl->data.resize(MAX_PACKETSIZE);
+      size_t length = pImpl->socket.receive_from(
+          boost::asio::buffer(pImpl->data.data(), pImpl->data.size()),
+          pImpl->sender_endpoint);
+      pImpl->data.resize(length);
+    }
 
     if (pImpl->data.size() > 4) {
       char *ptr = pImpl->data.data();
