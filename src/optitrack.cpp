@@ -67,6 +67,12 @@ namespace libmotioncapture {
       , socket(io_context)
       , sender_endpoint()
       , data(MAX_PACKETSIZE)
+      // NB: do NOT use time_point::min() here — subtracting it from a normal
+      // now() overflows steady_clock's int64-ns representation, and with -O2
+      // the rate-limit comparison in waitForNextFrame() folds to a permanent
+      // false, so the MODELDEF refresh request never gets sent.
+      , last_modeldef_refresh(std::chrono::steady_clock::now() -
+                              std::chrono::hours(1))
     {
     }
     // void getObjectByRigidbody(
@@ -405,6 +411,16 @@ namespace libmotioncapture {
     std::chrono::steady_clock::time_point last_keepalive;
     std::vector<char> data;
 
+    // MODELDEF refresh state. Set when an enabled-asset-list change is
+    // observed (either Motive sets bTrackedModelsChanged in frame params,
+    // or rigidBodies() encounters an ID not in rigidBodyDefinitions) and
+    // cleared when waitForNextFrame sends a NAT_REQUEST_MODELDEF.
+    // Rate-limited by last_modeldef_refresh so a stuck flag does not spam
+    // Motive's command port. Mutable so the const rigidBodies() observer
+    // can flip the flag.
+    mutable bool modeldef_refresh_pending = false;
+    std::chrono::steady_clock::time_point last_modeldef_refresh;
+
     struct rigidBody {
       int ID;
       float x;
@@ -618,15 +634,56 @@ namespace libmotioncapture {
       }
     }
 
+    // Re-request NAT_MODELDEF when something signalled an asset-list change.
+    // Two trigger sources flip pImpl->modeldef_refresh_pending:
+    //   1. The bTrackedModelsChanged bit in frame params (set below by the
+    //      frame parser when Motive flips it).
+    //   2. rigidBodies() observing a rigid-body ID not in rigidBodyDefinitions
+    //      (e.g. Motive enabled a new rigid body since the last MODELDEF).
+    // Rate-limit to once per 2 s so a stuck flag — or Motive sending the
+    // changed-bit on every frame — does not flood Motive's command port.
+    // MODELDEF replies from Motive (id=5) are processed inline by the
+    // streaming loop below.
+    {
+      auto now = std::chrono::steady_clock::now();
+      auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          now - pImpl->last_modeldef_refresh).count();
+      if (pImpl->modeldef_refresh_pending && elapsed_ms >= 2000) {
+        struct { uint16_t iMessage; uint16_t nDataBytes; } req =
+            {NAT_REQUEST_MODELDEF, 0};
+        boost::system::error_code ec;
+        pImpl->socket.send_to(
+            boost::asio::buffer(&req, sizeof(req)),
+            pImpl->endpoint_cmd, 0, ec);
+        pImpl->modeldef_refresh_pending = false;
+        pImpl->last_modeldef_refresh = now;
+      }
+    }
+
+    // Helper: peek a packet's NatNet message id from the first two bytes.
+    auto peek_msg_id = [](const std::vector<char>& buf, size_t len) -> uint16_t {
+      if (len < 2) return 0xFFFF;
+      uint16_t id = 0;
+      std::memcpy(&id, buf.data(), 2);
+      return id;
+    };
+
     // Block until we receive a frame.  On SO_RCVTIMEO expiry (EAGAIN /
     // would_block) the stream has stalled; send a NAT_CONNECT re-handshake
     // attempt and wait again.  Any other error (e.g. SIGINT → EBADF)
     // propagates so the caller can shut down cleanly.
+    //
+    // MODELDEF replies (id=5) from a re-request triggered above arrive
+    // interleaved with frame data; they are parsed in-place and the read
+    // continues until a real frame (id=7) lands. The frame buffer
+    // (pImpl->data) is only overwritten with frame packets so a MODELDEF
+    // packet showing up during the drain cannot clobber the current frame.
+    std::vector<char> packet_buf(MAX_PACKETSIZE);
     while (true) {
-      pImpl->data.resize(MAX_PACKETSIZE);
+      packet_buf.resize(MAX_PACKETSIZE);
       boost::system::error_code ec;
       size_t length = pImpl->socket.receive_from(
-          boost::asio::buffer(pImpl->data.data(), pImpl->data.size()),
+          boost::asio::buffer(packet_buf.data(), packet_buf.size()),
           pImpl->sender_endpoint, 0, ec);
       if (ec) {
         if (ec == boost::asio::error::would_block) {
@@ -641,17 +698,34 @@ namespace libmotioncapture {
         }
         throw boost::system::system_error(ec);
       }
-      pImpl->data.resize(length);
+      packet_buf.resize(length);
+      const uint16_t msg_id = peek_msg_id(packet_buf, length);
+      if (msg_id == NAT_MODELDEF) {
+        pImpl->parseModelDef(packet_buf.data(), packet_buf.size());
+        continue;
+      }
+      // Treat any other packet (typically id=7 frame data) as the current
+      // frame. Downstream parsing handles the id check.
+      pImpl->data = std::move(packet_buf);
       break;
     }
 
-    // Drain any additional queued frames to get the latest data.
+    // Drain any additional queued frames to get the latest data. MODELDEF
+    // replies in the backlog are parsed in-place; only frame-shaped packets
+    // overwrite pImpl->data.
     while (pImpl->socket.available() > 0) {
-      pImpl->data.resize(MAX_PACKETSIZE);
+      packet_buf.resize(MAX_PACKETSIZE);
       size_t length = pImpl->socket.receive_from(
-          boost::asio::buffer(pImpl->data.data(), pImpl->data.size()),
+          boost::asio::buffer(packet_buf.data(), packet_buf.size()),
           pImpl->sender_endpoint);
-      pImpl->data.resize(length);
+      packet_buf.resize(length);
+      const uint16_t msg_id = peek_msg_id(packet_buf, length);
+      if (msg_id == NAT_MODELDEF) {
+        pImpl->parseModelDef(packet_buf.data(), packet_buf.size());
+        continue;
+      }
+      pImpl->data = std::move(packet_buf);
+      packet_buf.clear();  // reset for next iteration's resize
     }
 
     if (pImpl->data.size() > 4) {
@@ -983,6 +1057,11 @@ namespace libmotioncapture {
         ptr += 2;
         // bool bIsRecording = (params & 0x01) != 0;                  // 0x01 Motive is recording
         bool bTrackedModelsChanged = (params & 0x02) != 0;         // 0x02 Actively tracked model list has changed
+        if (bTrackedModelsChanged) {
+          // Schedule a MODELDEF refresh at the top of the next
+          // waitForNextFrame call (rate-limited to once per 2 s).
+          pImpl->modeldef_refresh_pending = true;
+        }
 
         // end of data tag
         // int eod = 0; memcpy(&eod, ptr, 4); ptr += 4;
@@ -1014,6 +1093,13 @@ namespace libmotioncapture {
           xoffset = def.xoffset;
           yoffset = def.yoffset;
           zoffset = def.zoffset;
+        } else {
+          // Frame data carries a rigid-body ID that wasn't in the most
+          // recent MODELDEF — almost certainly an asset Motive started
+          // streaming after our initial handshake. Schedule a refresh so
+          // waitForNextFrame() can fetch the real name on its next call.
+          // (The mutable field lets a const observer flip the flag.)
+          pImpl->modeldef_refresh_pending = true;
         }
 
         if (name.empty()) {
