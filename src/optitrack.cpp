@@ -523,26 +523,67 @@ namespace libmotioncapture {
 
     // Read one packet of a specific NatNet message ID, dropping any frame-data
     // packets (id=7) that may interleave once Motive has started streaming.
-    auto receive_message = [&](uint16_t expected_id, void* out, size_t out_size) -> size_t {
-      for (int attempts = 0; attempts < 200; ++attempts) {
+    //
+    // BOUNDED BY TIME, NOT BY ATTEMPTS (2026-07-30). The previous version gave up
+    // after 200 receives, and every interleaved frame-data packet spent one. With
+    // Motive streaming at ~120 Hz that is ~1.7 s of real patience no matter what
+    // the socket timeout says, and the failure it produces is the opaque
+    // "Did not receive expected NatNet message id=5" that aborts the whole node.
+    //
+    // It also re-sends the request while waiting. NatNet is UDP with no
+    // retransmission, so a single lost request — or a lost reply — was previously
+    // fatal even though asking again costs nothing.
+    //
+    // ⚠️ What this CANNOT fix: a reply that is too large for the path MTU. The
+    // MODELDEF grows with every enabled asset, and a fragmented UDP datagram is
+    // dropped outright on some networks (this lab's Wi-Fi does exactly that, see
+    // the repo's issue #88). If the diagnostic below reports plenty of frame data
+    // and no id=5, suspect the transport rather than the timing: stream over
+    // Ethernet, run the client on the Motive host, or reduce the enabled asset
+    // count. That is also why the error now says what it actually saw.
+    auto receive_message = [&](uint16_t expected_id, void* out, size_t out_size,
+                               const void* retry_cmd = nullptr,
+                               size_t retry_len = 0) -> size_t {
+      using clock = std::chrono::steady_clock;
+      const auto deadline = clock::now() + std::chrono::seconds(20);
+      auto next_retry = clock::now() + std::chrono::seconds(2);
+      size_t discarded = 0, timeouts = 0;
+      while (clock::now() < deadline) {
+        if (retry_cmd && clock::now() >= next_retry) {
+          boost::system::error_code tx_ec;
+          pImpl->socket.send_to(boost::asio::buffer(retry_cmd, retry_len),
+                                endpoint_cmd, 0, tx_ec);
+          next_retry = clock::now() + std::chrono::seconds(2);
+        }
         boost::system::error_code rx_ec;
         size_t len = pImpl->socket.receive_from(
             boost::asio::buffer(recv_buf.data(), recv_buf.size()),
             sender_endpoint, 0, rx_ec);
         if (rx_ec || len < 2) {
+          ++timeouts;   // SO_RCVTIMEO fired: nothing arrived at all
           continue;
         }
         uint16_t msg_id = 0;
         std::memcpy(&msg_id, recv_buf.data(), 2);
         if (msg_id != expected_id) {
+          ++discarded;
           continue;
         }
         const size_t copy_len = std::min(len, out_size);
         std::memcpy(out, recv_buf.data(), copy_len);
         return len;
       }
-      throw std::runtime_error("Did not receive expected NatNet message id=" +
-                               std::to_string(expected_id));
+      throw std::runtime_error(
+          "Did not receive expected NatNet message id=" + std::to_string(expected_id) +
+          " within 20 s (discarded " + std::to_string(discarded) +
+          " other packets, " + std::to_string(timeouts) + " receive timeouts). " +
+          (discarded > 0
+               ? "Motive IS streaming, so the reply is being lost rather than never sent: "
+                 "a MODELDEF larger than the path MTU is fragmented and some networks drop "
+                 "every fragmented UDP datagram. Try Ethernet, running this on the Motive "
+                 "host, or fewer enabled rigid bodies."
+               : "Nothing arrived at all — check the host address, the firewall, and that "
+                 "Motive is streaming."));
     };
 
     // NAT_CONNECT — also serves as the unicast subscribe (registers our
@@ -551,7 +592,8 @@ namespace libmotioncapture {
     pImpl->socket.send_to(boost::asio::buffer(&connectCmd, sizeof(connectCmd)), endpoint_cmd);
 
     sResponse response;
-    receive_message(NAT_SERVERINFO, &response, sizeof(response));
+    receive_message(NAT_SERVERINFO, &response, sizeof(response),
+                    &connectCmd, sizeof(connectCmd));
 
     std::ostringstream stringStream;
     stringStream << (int)response.NatNetVersion[0] << "."
@@ -577,7 +619,8 @@ namespace libmotioncapture {
     sRequest modelDefCmd = {NAT_REQUEST_MODELDEF, 0};
     pImpl->socket.send_to(boost::asio::buffer(&modelDefCmd, sizeof(modelDefCmd)), endpoint_cmd);
     std::vector<char> modelDef(MAX_PACKETSIZE);
-    size_t modelDef_len = receive_message(NAT_MODELDEF, modelDef.data(), modelDef.size());
+    size_t modelDef_len = receive_message(NAT_MODELDEF, modelDef.data(), modelDef.size(),
+                                         &modelDefCmd, sizeof(modelDefCmd));
     modelDef.resize(modelDef_len);
     pImpl->parseModelDef(modelDef.data(), modelDef.size());
 
