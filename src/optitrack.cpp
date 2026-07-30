@@ -534,13 +534,20 @@ namespace libmotioncapture {
     // retransmission, so a single lost request — or a lost reply — was previously
     // fatal even though asking again costs nothing.
     //
-    // ⚠️ What this CANNOT fix: a reply that is too large for the path MTU. The
-    // MODELDEF grows with every enabled asset, and a fragmented UDP datagram is
-    // dropped outright on some networks (this lab's Wi-Fi does exactly that, see
-    // the repo's issue #88). If the diagnostic below reports plenty of frame data
-    // and no id=5, suspect the transport rather than the timing: stream over
-    // Ethernet, run the client on the Motive host, or reduce the enabled asset
-    // count. That is also why the error now says what it actually saw.
+    // ⚠️ What this CANNOT fix, and what the real fault usually is: a reply too
+    // large for the path MTU. MEASURED 2026-07-30 on this lab's Wi-Fi, between two
+    // hosts on 10.22.41.0/24, UDP payloads of 1000/1400/1472 B arrived 5/5 each
+    // while 1600/2000/3000/8000 B arrived 0/5 — i.e. EVERY IP-fragmented datagram
+    // is dropped (1472 = 1500 MTU - 20 IP - 8 UDP). Independently confirmed the
+    // same day against Motive itself: NAT_SERVERINFO (283 B) returned in 0.0 s,
+    // then MODELDEF never arrived in 12 s while 1231 frame-data packets streamed
+    // past. Motive was healthy; the reply was simply too big to survive the path.
+    //
+    // MODELDEF grows with every enabled asset, which is why it fails past ~2 rigid
+    // bodies and works below that. So if the diagnostic below reports plenty of
+    // frame data and no id=5, the fix is TRANSPORT, not timing: enable fewer rigid
+    // bodies, or run this client on a wired host. Same root cause as the repo's
+    // issue #88 (cross-host DDS discovery), in a place nobody connected to it.
     auto receive_message = [&](uint16_t expected_id, void* out, size_t out_size,
                                const void* retry_cmd = nullptr,
                                size_t retry_len = 0) -> size_t {
