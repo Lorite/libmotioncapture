@@ -501,7 +501,14 @@ namespace libmotioncapture {
     pImpl->socket.set_option(boost::asio::ip::udp::socket::reuse_address(true));
 
     boost::system::error_code bind_ec;
-    boost::asio::ip::udp::endpoint local_endpoint(listen_address_boost, kDefaultDataPort);
+    // Always bind the data socket to the wildcard address. On Linux a UDP socket
+    // bound to a unicast address never receives multicast datagrams (the
+    // destination 239.x does not match the bound address), so a specific-address
+    // bind silently kills multicast mode. interface_ip's job is to pin the
+    // multicast group JOIN below (and with it the IGMP egress interface), not
+    // the bind. Unicast keying is unaffected: the source address of the first
+    // NatNet command is chosen by routing toward the server either way.
+    boost::asio::ip::udp::endpoint local_endpoint(boost::asio::ip::address_v4::any(), kDefaultDataPort);
     pImpl->socket.bind(local_endpoint, bind_ec);
     if (bind_ec) {
       throw std::runtime_error(
