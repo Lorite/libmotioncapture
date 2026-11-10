@@ -2,7 +2,11 @@
 
 #include <boost/asio.hpp>
 #include <chrono>
+#include <algorithm>
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <iostream>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -411,6 +415,19 @@ namespace libmotioncapture {
     std::chrono::steady_clock::time_point last_keepalive;
     std::vector<char> data;
 
+    // IN-ORDER FRAMES (2026-11-10, Lorite fork). waitForNextFrame() used to
+    // drain the socket and keep only the newest frame. On the Orin, Wi-Fi and
+    // the rest of the stack make NatNet frames reach the process in bunches
+    // (several after a 50 to 60 ms pause), so every bunch lost all frames but
+    // one: 22 % of 120 Hz in a teleop trial, while a raw socket on the same
+    // host received 2401 of 2401 frames. Now frames are returned in order, and
+    // a frame is skipped only when it is older than max_frame_age_ms (kernel
+    // receive time, SO_TIMESTAMPNS) while a newer one is already queued, so the
+    // latency stays bounded. max_frame_age_ms = 0 restores drain-to-newest.
+    // Set with LIBMOTIONCAPTURE_OPTITRACK_MAX_FRAME_AGE_MS (default 100).
+    double max_frame_age_ms = 100.0;
+    uint64_t frames_skipped_stale = 0;
+
     // MODELDEF refresh state. Set when an enabled-asset-list change is
     // observed (either Motive sets bTrackedModelsChanged in frame params,
     // or rigidBodies() encounters an ID not in rigidBodyDefinitions) and
@@ -523,6 +540,14 @@ namespace libmotioncapture {
     struct timeval rcvtimeo { .tv_sec = 2, .tv_usec = 0 };
     setsockopt(pImpl->socket.native_handle(), SOL_SOCKET, SO_RCVTIMEO,
                reinterpret_cast<const char*>(&rcvtimeo), sizeof(rcvtimeo));
+
+    // Kernel receive stamps for the frame-age bound in waitForNextFrame().
+    int stamp_on = 1;
+    setsockopt(pImpl->socket.native_handle(), SOL_SOCKET, SO_TIMESTAMPNS,
+               &stamp_on, sizeof(stamp_on));
+    if (const char* env = std::getenv("LIBMOTIONCAPTURE_OPTITRACK_MAX_FRAME_AGE_MS")) {
+      pImpl->max_frame_age_ms = std::max(0.0, std::atof(env));
+    }
 
     udp::endpoint endpoint_cmd(boost::asio::ip::make_address(hostname), port_command);
     udp::endpoint sender_endpoint;
@@ -735,15 +760,48 @@ namespace libmotioncapture {
     // continues until a real frame (id=7) lands. The frame buffer
     // (pImpl->data) is only overwritten with frame packets so a MODELDEF
     // packet showing up during the drain cannot clobber the current frame.
+    // Receive one datagram with its kernel receive time (SO_TIMESTAMPNS, set in
+    // the constructor). Returns the length, or -1 with errno set: EAGAIN or
+    // EWOULDBLOCK when SO_RCVTIMEO expired.
+    const int fd = pImpl->socket.native_handle();
+    auto recv_stamped = [fd](std::vector<char>& buf, double& age_ms) -> ssize_t {
+      buf.resize(MAX_PACKETSIZE);
+      struct iovec iov;
+      iov.iov_base = buf.data();
+      iov.iov_len = buf.size();
+      alignas(struct cmsghdr) char ctrl[CMSG_SPACE(sizeof(struct timespec))];
+      struct msghdr msg;
+      std::memset(&msg, 0, sizeof(msg));
+      msg.msg_iov = &iov;
+      msg.msg_iovlen = 1;
+      msg.msg_control = ctrl;
+      msg.msg_controllen = sizeof(ctrl);
+      const ssize_t n = ::recvmsg(fd, &msg, 0);
+      age_ms = 0.0;
+      if (n < 0) {
+        return n;
+      }
+      buf.resize(static_cast<size_t>(n));
+      for (struct cmsghdr* c = CMSG_FIRSTHDR(&msg); c != nullptr; c = CMSG_NXTHDR(&msg, c)) {
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_TIMESTAMPNS) {
+          struct timespec ts;
+          std::memcpy(&ts, CMSG_DATA(c), sizeof(ts));
+          struct timespec now;
+          clock_gettime(CLOCK_REALTIME, &now);
+          age_ms = (now.tv_sec - ts.tv_sec) * 1e3 + (now.tv_nsec - ts.tv_nsec) * 1e-6;
+        }
+      }
+      return n;
+    };
+
     std::vector<char> packet_buf(MAX_PACKETSIZE);
+    double frame_age_ms = 0.0;
     while (true) {
-      packet_buf.resize(MAX_PACKETSIZE);
-      boost::system::error_code ec;
-      size_t length = pImpl->socket.receive_from(
-          boost::asio::buffer(packet_buf.data(), packet_buf.size()),
-          pImpl->sender_endpoint, 0, ec);
-      if (ec) {
-        if (ec == boost::asio::error::would_block) {
+      double age_ms = 0.0;
+      const ssize_t length = recv_stamped(packet_buf, age_ms);
+      if (length < 0) {
+        const int err = errno;
+        if (err == EAGAIN || err == EWOULDBLOCK) {
           // Stream stalled — attempt a NAT_CONNECT re-handshake.  The
           // periodic NAT_KEEPALIVE above prevents this in steady state.
           struct { uint16_t iMessage; uint16_t nDataBytes; } reconnect = {0, 0};
@@ -753,10 +811,13 @@ namespace libmotioncapture {
               0, reconnect_ec);
           continue;
         }
-        throw boost::system::system_error(ec);
+        if (err == EINTR) {
+          continue;
+        }
+        throw boost::system::system_error(
+            boost::system::error_code(err, boost::system::system_category()));
       }
-      packet_buf.resize(length);
-      const uint16_t msg_id = peek_msg_id(packet_buf, length);
+      const uint16_t msg_id = peek_msg_id(packet_buf, static_cast<size_t>(length));
       if (msg_id == NAT_MODELDEF) {
         pImpl->parseModelDef(packet_buf.data(), packet_buf.size());
         continue;
@@ -764,25 +825,33 @@ namespace libmotioncapture {
       // Treat any other packet (typically id=7 frame data) as the current
       // frame. Downstream parsing handles the id check.
       pImpl->data = std::move(packet_buf);
+      frame_age_ms = age_ms;
       break;
     }
 
-    // Drain any additional queued frames to get the latest data. MODELDEF
-    // replies in the backlog are parsed in-place; only frame-shaped packets
-    // overwrite pImpl->data.
-    while (pImpl->socket.available() > 0) {
-      packet_buf.resize(MAX_PACKETSIZE);
-      size_t length = pImpl->socket.receive_from(
-          boost::asio::buffer(packet_buf.data(), packet_buf.size()),
-          pImpl->sender_endpoint);
-      packet_buf.resize(length);
-      const uint16_t msg_id = peek_msg_id(packet_buf, length);
+    // Frames are returned IN ORDER (see max_frame_age_ms in the impl): a
+    // queued frame replaces the current one only while the current one is
+    // older than max_frame_age_ms, so a bunch of frames that arrived together
+    // is published frame by frame instead of collapsing to its newest one.
+    // max_frame_age_ms == 0 keeps the old behavior, drain to the newest.
+    // MODELDEF replies in the backlog are parsed in place and never replace
+    // the current frame.
+    while (pImpl->socket.available() > 0 &&
+           (pImpl->max_frame_age_ms <= 0.0 || frame_age_ms > pImpl->max_frame_age_ms)) {
+      double age_ms = 0.0;
+      const ssize_t length = recv_stamped(packet_buf, age_ms);
+      if (length < 0) {
+        break;
+      }
+      const uint16_t msg_id = peek_msg_id(packet_buf, static_cast<size_t>(length));
       if (msg_id == NAT_MODELDEF) {
         pImpl->parseModelDef(packet_buf.data(), packet_buf.size());
         continue;
       }
       pImpl->data = std::move(packet_buf);
-      packet_buf.clear();  // reset for next iteration's resize
+      packet_buf = std::vector<char>();
+      frame_age_ms = age_ms;
+      ++pImpl->frames_skipped_stale;
     }
 
     if (pImpl->data.size() > 4) {
